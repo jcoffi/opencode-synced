@@ -1401,7 +1401,8 @@ export function createSyncService(hostCtx: SyncServiceContext): SyncService {
           }
         }
 
-        return `Unable to automatically resolve. Please manually resolve in: ${repoRoot}`;
+        const reason = decision.reason ? ` (${decision.reason})` : '';
+        return `Unable to automatically resolve${reason}. Please manually resolve in: ${repoRoot}`;
       }),
   };
 }
