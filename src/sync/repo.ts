@@ -427,8 +427,10 @@ async function getStatusLines($: Shell, repoDir: string): Promise<string[]> {
       .split('\n')
       .map((line) => line.trim())
       .filter(Boolean);
-  } catch {
-    return [];
+  } catch (error) {
+    // Never report "no changes" when the status probe itself failed - that silently
+    // turns an inability to look into a claim that the tree is clean.
+    throw new SyncCommandError(`Failed to read repo status: ${formatError(error)}`);
   }
 }
 
