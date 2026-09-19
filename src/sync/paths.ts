@@ -28,6 +28,7 @@ export interface SyncItem {
   isSecret: boolean;
   isConfigFile: boolean;
   preserveWhenMissing?: boolean;
+  chunkLargeFiles?: boolean;
 }
 
 export interface ExtraPathPlan {
@@ -43,6 +44,7 @@ export interface SyncPlan {
   repoRoot: string;
   homeDir: string;
   platform: NodeJS.Platform;
+  configRoot: string;
 }
 
 const DEFAULT_CONFIG_NAME = 'opencode.json';
@@ -52,7 +54,19 @@ const DEFAULT_SYNC_CONFIG_NAME = 'opencode-synced.jsonc';
 const DEFAULT_OVERRIDES_NAME = 'opencode-synced.overrides.jsonc';
 const DEFAULT_STATE_NAME = 'sync-state.json';
 
-const CONFIG_DIRS = ['agent', 'command', 'mode', 'tool', 'themes', 'plugin'];
+const CONFIG_DIRS = [
+  'agent',
+  'agents',
+  'command',
+  'commands',
+  'mode',
+  'modes',
+  'tool',
+  'tools',
+  'themes',
+  'plugin',
+  'plugins',
+];
 const SESSION_DIRS = ['storage/session', 'storage/message', 'storage/part', 'storage/session_diff'];
 const SESSION_DB_FILE = 'opencode.db';
 const PROMPT_STASH_FILES = ['prompt-stash.jsonl', 'prompt-history.jsonl'];
@@ -60,12 +74,20 @@ const MODEL_FAVORITES_FILE = 'model.json';
 const SKILLS_DIR = 'skills';
 const HOME_AGENTS_DIR = '.agents';
 
+function pathApiFor(platform: NodeJS.Platform): typeof path.posix {
+  return platform === 'win32' ? path.win32 : path.posix;
+}
+
 export function resolveHomeDir(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform
 ): string {
   if (platform === 'win32') {
-    return env.USERPROFILE ?? env.HOMEDRIVE ?? env.HOME ?? '';
+    if (env.USERPROFILE) return env.USERPROFILE;
+    if (env.HOMEDRIVE && env.HOMEPATH) {
+      return path.win32.join(env.HOMEDRIVE, env.HOMEPATH);
+    }
+    return env.HOME ?? '';
   }
 
   return env.HOME ?? '';
@@ -76,6 +98,7 @@ export function resolveXdgPaths(
   platform: NodeJS.Platform = process.platform
 ): XdgPaths {
   const homeDir = resolveHomeDir(env, platform);
+  const pathApi = pathApiFor(platform);
 
   if (!homeDir) {
     return {
@@ -86,17 +109,9 @@ export function resolveXdgPaths(
     };
   }
 
-  if (platform === 'win32') {
-    const configDir = env.APPDATA ?? path.join(homeDir, 'AppData', 'Roaming');
-    const dataDir = env.LOCALAPPDATA ?? path.join(homeDir, 'AppData', 'Local');
-    // Windows doesn't have XDG_STATE_HOME equivalent, use LOCALAPPDATA
-    const stateDir = env.LOCALAPPDATA ?? path.join(homeDir, 'AppData', 'Local');
-    return { homeDir, configDir, dataDir, stateDir };
-  }
-
-  const configDir = env.XDG_CONFIG_HOME ?? path.join(homeDir, '.config');
-  const dataDir = env.XDG_DATA_HOME ?? path.join(homeDir, '.local', 'share');
-  const stateDir = env.XDG_STATE_HOME ?? path.join(homeDir, '.local', 'state');
+  const configDir = env.XDG_CONFIG_HOME ?? pathApi.join(homeDir, '.config');
+  const dataDir = env.XDG_DATA_HOME ?? pathApi.join(homeDir, '.local', 'share');
+  const stateDir = env.XDG_STATE_HOME ?? pathApi.join(homeDir, '.local', 'state');
 
   return { homeDir, configDir, dataDir, stateDir };
 }
@@ -106,41 +121,58 @@ export function resolveSyncLocations(
   platform: NodeJS.Platform = process.platform
 ): SyncLocations {
   const xdg = resolveXdgPaths(env, platform);
+  const pathApi = pathApiFor(platform);
   const customConfigDir = env.opencode_config_dir;
   const configRoot = customConfigDir
-    ? path.resolve(expandHome(customConfigDir, xdg.homeDir))
-    : path.join(xdg.configDir, 'opencode');
-  const dataRoot = path.join(xdg.dataDir, 'opencode');
+    ? pathApi.resolve(expandHome(customConfigDir, xdg.homeDir, platform))
+    : pathApi.join(xdg.configDir, 'opencode');
+  const dataRoot = pathApi.join(xdg.dataDir, 'opencode');
 
   return {
     xdg,
     configRoot,
-    syncConfigPath: path.join(configRoot, DEFAULT_SYNC_CONFIG_NAME),
-    overridesPath: path.join(configRoot, DEFAULT_OVERRIDES_NAME),
-    statePath: path.join(dataRoot, DEFAULT_STATE_NAME),
-    defaultRepoDir: path.join(dataRoot, 'opencode-synced', 'repo'),
+    syncConfigPath: pathApi.join(configRoot, DEFAULT_SYNC_CONFIG_NAME),
+    overridesPath: pathApi.join(configRoot, DEFAULT_OVERRIDES_NAME),
+    statePath: pathApi.join(dataRoot, DEFAULT_STATE_NAME),
+    defaultRepoDir: pathApi.join(dataRoot, 'opencode-synced', 'repo'),
   };
 }
 
-export function expandHome(inputPath: string, homeDir: string): string {
+export function expandHome(
+  inputPath: string,
+  homeDir: string,
+  platform: NodeJS.Platform = process.platform
+): string {
   if (!inputPath) return inputPath;
   if (!homeDir) return inputPath;
   if (inputPath === '~') return homeDir;
-  if (inputPath.startsWith('~/')) return path.join(homeDir, inputPath.slice(2));
+  if (inputPath.startsWith('~/')) return pathApiFor(platform).join(homeDir, inputPath.slice(2));
   return inputPath;
 }
 
 export function normalizePath(
   inputPath: string,
   homeDir: string,
-  platform: NodeJS.Platform = process.platform
+  platform: NodeJS.Platform = process.platform,
+  baseDir?: string
 ): string {
-  const expanded = expandHome(inputPath, homeDir);
-  const resolved = path.resolve(expanded);
+  const pathApi = pathApiFor(platform);
+  const expanded = expandHome(inputPath, homeDir, platform);
+  const resolved = baseDir ? pathApi.resolve(baseDir, expanded) : pathApi.resolve(expanded);
   if (platform === 'win32') {
     return resolved.toLowerCase();
   }
   return resolved;
+}
+
+export function resolveExtraPath(
+  inputPath: string,
+  locations: SyncLocations,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const configRoot = pathApi.join(locations.xdg.configDir, 'opencode');
+  return normalizePath(inputPath, locations.xdg.homeDir, platform, configRoot);
 }
 
 export function isSamePath(
@@ -162,9 +194,13 @@ export function encodeExtraPath(inputPath: string): string {
 
 export const encodeSecretPath = encodeExtraPath;
 
-export function resolveRepoRoot(config: SyncConfig | null, locations: SyncLocations): string {
+export function resolveRepoRoot(
+  config: SyncConfig | null,
+  locations: SyncLocations,
+  platform: NodeJS.Platform = process.platform
+): string {
   if (config?.localRepoPath) {
-    return expandHome(config.localRepoPath, locations.xdg.homeDir);
+    return expandHome(config.localRepoPath, locations.xdg.homeDir, platform);
   }
 
   return locations.defaultRepoDir;
@@ -176,27 +212,28 @@ export function buildSyncPlan(
   repoRoot: string,
   platform: NodeJS.Platform = process.platform
 ): SyncPlan {
+  const pathApi = pathApiFor(platform);
   const configRoot = locations.configRoot;
-  const dataRoot = path.join(locations.xdg.dataDir, 'opencode');
-  const stateRoot = path.join(locations.xdg.stateDir, 'opencode');
-  const repoConfigRoot = path.join(repoRoot, 'config');
-  const repoDataRoot = path.join(repoRoot, 'data');
-  const repoSecretsRoot = path.join(repoRoot, 'secrets');
-  const repoStateRoot = path.join(repoRoot, 'state');
-  const repoExtraDir = path.join(repoSecretsRoot, 'extra');
-  const manifestPath = path.join(repoSecretsRoot, 'extra-manifest.json');
-  const repoConfigExtraDir = path.join(repoConfigRoot, 'extra');
-  const configManifestPath = path.join(repoConfigRoot, 'extra-manifest.json');
+  const dataRoot = pathApi.join(locations.xdg.dataDir, 'opencode');
+  const stateRoot = pathApi.join(locations.xdg.stateDir, 'opencode');
+  const repoConfigRoot = pathApi.join(repoRoot, 'config');
+  const repoDataRoot = pathApi.join(repoRoot, 'data');
+  const repoSecretsRoot = pathApi.join(repoRoot, 'secrets');
+  const repoStateRoot = pathApi.join(repoRoot, 'state');
+  const repoExtraDir = pathApi.join(repoSecretsRoot, 'extra');
+  const manifestPath = pathApi.join(repoSecretsRoot, 'extra-manifest.json');
+  const repoConfigExtraDir = pathApi.join(repoConfigRoot, 'extra');
+  const configManifestPath = pathApi.join(repoConfigRoot, 'extra-manifest.json');
 
   const items: SyncItem[] = [];
   const usingSecretsBackend = hasSecretsBackend(config);
-  const authJsonPath = path.join(dataRoot, 'auth.json');
-  const mcpAuthJsonPath = path.join(dataRoot, 'mcp-auth.json');
+  const authJsonPath = pathApi.join(dataRoot, 'auth.json');
+  const mcpAuthJsonPath = pathApi.join(dataRoot, 'mcp-auth.json');
 
   const addFile = (name: string, isSecret: boolean, isConfigFile: boolean): void => {
     items.push({
-      localPath: path.join(configRoot, name),
-      repoPath: path.join(repoConfigRoot, name),
+      localPath: pathApi.join(configRoot, name),
+      repoPath: pathApi.join(repoConfigRoot, name),
       type: 'file',
       isSecret,
       isConfigFile,
@@ -210,8 +247,8 @@ export function buildSyncPlan(
 
   for (const dirName of CONFIG_DIRS) {
     items.push({
-      localPath: path.join(configRoot, dirName),
-      repoPath: path.join(repoConfigRoot, dirName),
+      localPath: pathApi.join(configRoot, dirName),
+      repoPath: pathApi.join(repoConfigRoot, dirName),
       type: 'dir',
       isSecret: false,
       isConfigFile: false,
@@ -220,8 +257,8 @@ export function buildSyncPlan(
 
   if (config.includeOpencodeSkills !== false) {
     items.push({
-      localPath: path.join(configRoot, SKILLS_DIR),
-      repoPath: path.join(repoConfigRoot, SKILLS_DIR),
+      localPath: pathApi.join(configRoot, SKILLS_DIR),
+      repoPath: pathApi.join(repoConfigRoot, SKILLS_DIR),
       type: 'dir',
       isSecret: false,
       isConfigFile: false,
@@ -230,8 +267,8 @@ export function buildSyncPlan(
 
   if (config.includeAgentsDir !== false) {
     items.push({
-      localPath: path.join(locations.xdg.homeDir, HOME_AGENTS_DIR),
-      repoPath: path.join(repoConfigRoot, HOME_AGENTS_DIR),
+      localPath: pathApi.join(locations.xdg.homeDir, HOME_AGENTS_DIR),
+      repoPath: pathApi.join(repoConfigRoot, HOME_AGENTS_DIR),
       type: 'dir',
       isSecret: false,
       isConfigFile: false,
@@ -240,8 +277,8 @@ export function buildSyncPlan(
 
   if (config.includeModelFavorites !== false) {
     items.push({
-      localPath: path.join(stateRoot, MODEL_FAVORITES_FILE),
-      repoPath: path.join(repoStateRoot, MODEL_FAVORITES_FILE),
+      localPath: pathApi.join(stateRoot, MODEL_FAVORITES_FILE),
+      repoPath: pathApi.join(repoStateRoot, MODEL_FAVORITES_FILE),
       type: 'file',
       isSecret: false,
       isConfigFile: false,
@@ -253,14 +290,14 @@ export function buildSyncPlan(
       items.push(
         {
           localPath: authJsonPath,
-          repoPath: path.join(repoDataRoot, 'auth.json'),
+          repoPath: pathApi.join(repoDataRoot, 'auth.json'),
           type: 'file',
           isSecret: true,
           isConfigFile: false,
         },
         {
           localPath: mcpAuthJsonPath,
-          repoPath: path.join(repoDataRoot, 'mcp-auth.json'),
+          repoPath: pathApi.join(repoDataRoot, 'mcp-auth.json'),
           type: 'file',
           isSecret: true,
           isConfigFile: false,
@@ -270,22 +307,24 @@ export function buildSyncPlan(
 
     if (config.includeSessions && !isTursoSessionBackend(config)) {
       items.push({
-        localPath: path.join(dataRoot, SESSION_DB_FILE),
-        repoPath: path.join(repoDataRoot, SESSION_DB_FILE),
+        localPath: pathApi.join(dataRoot, SESSION_DB_FILE),
+        repoPath: pathApi.join(repoDataRoot, SESSION_DB_FILE),
         type: 'file',
         isSecret: true,
         isConfigFile: false,
         preserveWhenMissing: true,
+        chunkLargeFiles: true,
       });
 
       for (const dirName of SESSION_DIRS) {
         items.push({
-          localPath: path.join(dataRoot, dirName),
-          repoPath: path.join(repoDataRoot, dirName),
+          localPath: pathApi.join(dataRoot, dirName),
+          repoPath: pathApi.join(repoDataRoot, dirName),
           type: 'dir',
           isSecret: true,
           isConfigFile: false,
           preserveWhenMissing: true,
+          chunkLargeFiles: dirName === 'storage/message',
         });
       }
     }
@@ -293,8 +332,8 @@ export function buildSyncPlan(
     if (config.includePromptStash) {
       for (const fileName of PROMPT_STASH_FILES) {
         items.push({
-          localPath: path.join(stateRoot, fileName),
-          repoPath: path.join(repoStateRoot, fileName),
+          localPath: pathApi.join(stateRoot, fileName),
+          repoPath: pathApi.join(repoStateRoot, fileName),
           type: 'file',
           isSecret: true,
           isConfigFile: false,
@@ -303,7 +342,9 @@ export function buildSyncPlan(
     }
   }
 
-  const extraSecretPaths = config.includeSecrets ? config.extraSecretPaths : [];
+  const extraSecretPaths = config.includeSecrets
+    ? config.extraSecretPaths.map((entry) => resolveExtraPath(entry, locations, platform))
+    : [];
   const filteredExtraSecrets = usingSecretsBackend
     ? extraSecretPaths.filter(
         (entry) =>
@@ -314,20 +355,20 @@ export function buildSyncPlan(
 
   const extraSecrets = buildExtraPathPlan(
     filteredExtraSecrets,
-    locations,
     repoExtraDir,
     manifestPath,
     platform
   );
 
-  const extraConfigPaths = (config.extraConfigPaths ?? []).filter(
-    (entry) =>
-      !items.some((item) => isSamePath(entry, item.localPath, locations.xdg.homeDir, platform))
-  );
+  const extraConfigPaths = (config.extraConfigPaths ?? [])
+    .map((entry) => resolveExtraPath(entry, locations, platform))
+    .filter(
+      (entry) =>
+        !items.some((item) => isSamePath(entry, item.localPath, locations.xdg.homeDir, platform))
+    );
 
   const extraConfigs = buildExtraPathPlan(
     extraConfigPaths,
-    locations,
     repoConfigExtraDir,
     configManifestPath,
     platform
@@ -340,28 +381,113 @@ export function buildSyncPlan(
     repoRoot,
     homeDir: locations.xdg.homeDir,
     platform,
+    configRoot: locations.configRoot,
   };
 }
 
 function buildExtraPathPlan(
-  inputPaths: string[] | undefined,
-  locations: SyncLocations,
+  sourcePaths: string[],
   repoExtraDir: string,
   manifestPath: string,
   platform: NodeJS.Platform
 ): ExtraPathPlan {
-  const allowlist = (inputPaths ?? []).map((entry) =>
-    normalizePath(entry, locations.xdg.homeDir, platform)
-  );
-
-  const entries = allowlist.map((sourcePath) => ({
+  const entries = sourcePaths.map((sourcePath) => ({
     sourcePath,
-    repoPath: path.join(repoExtraDir, encodeExtraPath(sourcePath)),
+    repoPath: pathApiFor(platform).join(repoExtraDir, encodeExtraPath(sourcePath)),
   }));
 
   return {
-    allowlist,
+    allowlist: sourcePaths,
     manifestPath,
     entries,
   };
+}
+
+/**
+ * Convert an absolute sourcePath to a portable form for the manifest.
+ * If the path is configRoot, store it as ".". Paths inside it are relative.
+ * If outside configRoot, store it with ~/ prefix (e.g. "~/.ssh/id_rsa").
+ * Manifest separators are always forward slashes.
+ */
+export function toPortablePath(
+  absolutePath: string,
+  configRoot: string,
+  homeDir: string,
+  pathApi: typeof path.posix = process.platform === 'win32' ? path.win32 : path.posix
+): string {
+  const relativeToConfig = relativeIfContained(absolutePath, configRoot, pathApi);
+  if (relativeToConfig !== null) {
+    return relativeToConfig === '' ? '.' : toPortableSeparators(relativeToConfig);
+  }
+
+  const relativeToHome = homeDir ? relativeIfContained(absolutePath, homeDir, pathApi) : null;
+  if (relativeToHome !== null) {
+    return relativeToHome === '' ? '~' : `~/${toPortableSeparators(relativeToHome)}`;
+  }
+
+  return toPortableSeparators(absolutePath);
+}
+
+/**
+ * Resolve a portable sourcePath from the manifest back to a local absolute path.
+ * "." and relative paths are resolved against configRoot.
+ * ~/ paths are expanded via the local homeDir.
+ * Absolute POSIX, drive-letter, and UNC paths remain absolute for backwards compatibility.
+ */
+export function fromPortablePath(
+  portablePath: string,
+  configRoot: string,
+  homeDir: string,
+  pathApi: typeof path.posix = process.platform === 'win32' ? path.win32 : path.posix
+): string {
+  if (!portablePath) return portablePath;
+
+  if (portablePath === '.') return pathApi.resolve(configRoot);
+  if (portablePath === '~') return pathApi.resolve(homeDir);
+  if (portablePath.startsWith('~/') || portablePath.startsWith('~\\')) {
+    return pathApi.resolve(homeDir, portablePath.slice(2));
+  }
+
+  if (isAbsoluteOnAnyPlatform(portablePath)) {
+    return portablePath;
+  }
+
+  return pathApi.resolve(configRoot, portablePath);
+}
+
+function relativeIfContained(
+  candidatePath: string,
+  rootPath: string,
+  pathApi: typeof path.posix
+): string | null {
+  const resolvedCandidate = pathApi.resolve(candidatePath);
+  const resolvedRoot = pathApi.resolve(rootPath);
+  const comparisonCandidate = normalizeForComparison(resolvedCandidate, pathApi);
+  const comparisonRoot = normalizeForComparison(resolvedRoot, pathApi);
+  const comparisonRelative = pathApi.relative(comparisonRoot, comparisonCandidate);
+
+  if (
+    comparisonRelative === '..' ||
+    comparisonRelative.startsWith(`..${pathApi.sep}`) ||
+    pathApi.isAbsolute(comparisonRelative)
+  ) {
+    return null;
+  }
+
+  return pathApi.relative(resolvedRoot, resolvedCandidate);
+}
+
+function normalizeForComparison(inputPath: string, pathApi: typeof path.posix): string {
+  const normalized = pathApi.normalize(inputPath);
+  return pathApi === path.win32 ? normalized.toLowerCase() : normalized;
+}
+
+function isAbsoluteOnAnyPlatform(inputPath: string): boolean {
+  if (path.posix.isAbsolute(inputPath)) return true;
+  if (/^[a-zA-Z]:[\\/]/.test(inputPath)) return true;
+  return /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+/.test(inputPath);
+}
+
+function toPortableSeparators(inputPath: string): string {
+  return inputPath.replace(/\\/g, '/');
 }

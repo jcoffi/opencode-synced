@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { PluginInput } from '@opencode-ai/plugin';
 
 import type { SyncConfig } from './config.js';
-import { pathExists } from './config.js';
+import { pathExists, sanitizeRepoUrl } from './config.js';
 import {
   RepoDivergedError,
   RepoPrivateRequiredError,
@@ -21,6 +21,16 @@ export interface RepoUpdateResult {
   branch: string;
 }
 
+export interface OversizedHistoryInspection {
+  oversizedPaths: string[];
+  unpushedCommits: number;
+  remoteExists: boolean;
+}
+
+const DEFAULT_MAX_GIT_BLOB_BYTES = 95 * 1024 * 1024;
+const MAX_RECOVERY_COMMITS = 100;
+const MAX_RECOVERY_TREE_ENTRIES = 200_000;
+
 type Shell = PluginInput['$'];
 
 export async function isRepoCloned(repoDir: string): Promise<boolean> {
@@ -34,7 +44,7 @@ export function resolveRepoIdentifier(config: SyncConfig): string {
     throw new SyncCommandError('Missing repo configuration.');
   }
 
-  if (repo.url) return repo.url;
+  if (repo.url) return redactRepoUrl(repo.url);
   if (repo.owner && repo.name) return `${repo.owner}/${repo.name}`;
 
   throw new SyncCommandError('Repo configuration must include url or owner/name.');
@@ -42,8 +52,51 @@ export function resolveRepoIdentifier(config: SyncConfig): string {
 
 export function resolveRepoBranch(config: SyncConfig, fallback = 'main'): string {
   const branch = config.repo?.branch;
-  if (branch) return branch;
-  return fallback;
+  return assertValidRepoBranch(branch || fallback);
+}
+
+export function assertValidRepoBranch(branch: string): string {
+  const invalid =
+    !branch ||
+    branch !== branch.trim() ||
+    branch === '@' ||
+    branch.startsWith('-') ||
+    branch.startsWith('.') ||
+    branch.endsWith('.') ||
+    branch.endsWith('/') ||
+    branch.includes('..') ||
+    branch.includes('//') ||
+    branch.includes('@{') ||
+    [...branch].some((character) => character.charCodeAt(0) <= 32) ||
+    /[~^:?*[\\]/.test(branch) ||
+    branch.split('/').some((part) => !part || part.startsWith('.') || part.endsWith('.lock'));
+
+  if (invalid) {
+    throw new SyncCommandError(`Invalid Git branch name: ${redactRemoteCredentials(branch)}`);
+  }
+  return branch;
+}
+
+export function isExplicitGitRemote(input: string): boolean {
+  const value = input.trim();
+  if (!value) return false;
+  if (path.isAbsolute(value) || path.win32.isAbsolute(value)) return true;
+  if (/^[^@\s]+@[^:\s]+:.+$/u.test(value)) return true;
+
+  try {
+    const parsed = new URL(value);
+    return ['http:', 'https:', 'ssh:', 'git:', 'file:'].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+export function redactRepoUrl(input: string): string {
+  return redactRemoteCredentials(sanitizeRepoUrl(input));
+}
+
+export function redactRemoteCredentials(input: string): string {
+  return input.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/giu, '$1[REDACTED]@');
 }
 
 export async function ensureRepoCloned(
@@ -52,13 +105,21 @@ export async function ensureRepoCloned(
   repoDir: string
 ): Promise<void> {
   if (await isRepoCloned(repoDir)) {
+    if (config.repo?.url) {
+      await ensureOriginMatches($, repoDir, config.repo.url);
+    }
     return;
   }
 
   await fs.mkdir(path.dirname(repoDir), { recursive: true });
-  const repoIdentifier = resolveRepoIdentifier(config);
+  const repoUrl = config.repo?.url;
 
   try {
+    if (repoUrl) {
+      await $`git clone ${sanitizeRepoUrl(repoUrl)} ${repoDir}`.quiet();
+      return;
+    }
+    const repoIdentifier = resolveRepoIdentifier(config);
     await $`gh repo clone ${repoIdentifier} ${repoDir}`.quiet();
   } catch (error) {
     throw new SyncCommandError(`Failed to clone repo: ${formatError(error)}`);
@@ -66,7 +127,10 @@ export async function ensureRepoCloned(
 }
 
 export async function ensureRepoPrivate($: Shell, config: SyncConfig): Promise<void> {
-  const repoIdentifier = resolveRepoIdentifier(config);
+  const repoIdentifier = resolveGitHubRepoIdentifier(config);
+  if (!repoIdentifier) {
+    throw new RepoVisibilityError('Unable to verify privacy for this non-GitHub remote.');
+  }
   let output: string;
 
   try {
@@ -85,6 +149,49 @@ export async function ensureRepoPrivate($: Shell, config: SyncConfig): Promise<v
   if (!isPrivate) {
     throw new RepoPrivateRequiredError('Secrets sync requires a private GitHub repo.');
   }
+}
+
+export function resolveGitHubRepoIdentifier(config: SyncConfig): string | null {
+  const repo = config.repo;
+  if (!repo) return null;
+  if (repo.url) {
+    const parsed = parseRepoReference(repo.url, '');
+    if (!parsed) return null;
+    return `${parsed.owner}/${parsed.name}`;
+  }
+  if (repo.owner && repo.name) return `${repo.owner}/${repo.name}`;
+  return null;
+}
+
+export function isGitHubRepoConfig(config: SyncConfig): boolean {
+  return resolveGitHubRepoIdentifier(config) !== null;
+}
+
+async function ensureOriginMatches(
+  $: Shell,
+  repoDir: string,
+  configuredUrl: string
+): Promise<void> {
+  let originUrl: string;
+  try {
+    originUrl = (await $`git -C ${repoDir} remote get-url origin`.quiet().text()).trim();
+  } catch (error) {
+    throw new SyncCommandError(`Failed to inspect existing repo origin: ${formatError(error)}`);
+  }
+
+  if (normalizeRemoteForComparison(originUrl) === normalizeRemoteForComparison(configuredUrl)) {
+    return;
+  }
+  throw new SyncCommandError(
+    'Existing local sync repo origin does not match the configured explicit remote.'
+  );
+}
+
+function normalizeRemoteForComparison(input: string): string {
+  const sanitized = sanitizeRepoUrl(input);
+  if (path.isAbsolute(sanitized)) return path.resolve(sanitized);
+  if (path.win32.isAbsolute(sanitized)) return path.win32.normalize(sanitized).toLowerCase();
+  return sanitized.replace(/\/$/u, '');
 }
 
 export function parseRepoVisibility(output: string): boolean {
@@ -106,10 +213,9 @@ export async function fetchAndFastForward(
     throw new SyncCommandError(`Failed to fetch repo: ${formatError(error)}`);
   }
 
-  await checkoutBranch($, repoDir, branch);
-
   const remoteRef = `origin/${branch}`;
-  const remoteExists = await hasRemoteRef($, repoDir, branch);
+  const remoteExists = await hasRemoteBranch($, repoDir, branch);
+  await checkoutBranch($, repoDir, branch, remoteExists);
   if (!remoteExists) {
     return { updated: false, branch };
   }
@@ -161,6 +267,78 @@ export async function pushBranch($: Shell, repoDir: string, branch: string): Pro
   }
 }
 
+export async function inspectOversizedUnpushedHistory(
+  $: Shell,
+  repoDir: string,
+  branch: string,
+  maxBlobBytes = DEFAULT_MAX_GIT_BLOB_BYTES
+): Promise<OversizedHistoryInspection> {
+  assertValidRepoBranch(branch);
+  if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes <= 0) {
+    throw new SyncCommandError('Invalid oversized Git blob safety limit.');
+  }
+
+  const remoteExists = await hasRemoteBranch($, repoDir, branch);
+  try {
+    await $`git -C ${repoDir} rev-parse --verify HEAD`.quiet();
+  } catch {
+    return { oversizedPaths: [], unpushedCommits: 0, remoteExists };
+  }
+  let revisions: string[];
+  try {
+    const output = remoteExists
+      ? await $`git -C ${repoDir} rev-list --max-count=${MAX_RECOVERY_COMMITS + 1} origin/${branch}..HEAD`
+          .quiet()
+          .text()
+      : await $`git -C ${repoDir} rev-list --max-count=${MAX_RECOVERY_COMMITS + 1} HEAD --not --remotes=origin`
+          .quiet()
+          .text();
+    revisions = output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    throw new SyncCommandError(`Failed to inspect unpushed Git history: ${formatError(error)}`);
+  }
+
+  if (revisions.length > MAX_RECOVERY_COMMITS) {
+    throw new SyncCommandError(
+      `Refusing to inspect more than ${MAX_RECOVERY_COMMITS} unpushed commits automatically.`
+    );
+  }
+
+  const oversizedPaths = new Set<string>();
+  let inspectedEntries = 0;
+  try {
+    for (const revision of revisions) {
+      const output = await $`git -C ${repoDir} ls-tree -r -l -z --full-tree ${revision}`
+        .quiet()
+        .text();
+      for (const entry of output.split('\0')) {
+        if (!entry) continue;
+        inspectedEntries += 1;
+        if (inspectedEntries > MAX_RECOVERY_TREE_ENTRIES) {
+          throw new SyncCommandError('Unpushed history exceeds the automatic recovery scan limit.');
+        }
+        const match = entry.match(/^\d+\s+blob\s+[a-f0-9]+\s+(\d+)\t([\s\S]+)$/u);
+        if (!match) continue;
+        const size = Number(match[1]);
+        const filePath = match[2] as string;
+        if (Number.isSafeInteger(size) && size > maxBlobBytes) oversizedPaths.add(filePath);
+      }
+    }
+  } catch (error) {
+    if (error instanceof SyncCommandError) throw error;
+    throw new SyncCommandError(`Failed to scan unpushed Git objects: ${formatError(error)}`);
+  }
+
+  return {
+    oversizedPaths: [...oversizedPaths].sort(),
+    unpushedCommits: revisions.length,
+    remoteExists,
+  };
+}
+
 async function getCurrentBranch($: Shell, repoDir: string): Promise<string> {
   try {
     const output = await $`git -C ${repoDir} rev-parse --abbrev-ref HEAD`.quiet().text();
@@ -172,11 +350,20 @@ async function getCurrentBranch($: Shell, repoDir: string): Promise<string> {
   }
 }
 
-async function checkoutBranch($: Shell, repoDir: string, branch: string): Promise<void> {
+async function checkoutBranch(
+  $: Shell,
+  repoDir: string,
+  branch: string,
+  remoteExists: boolean
+): Promise<void> {
   const exists = await hasLocalBranch($, repoDir, branch);
   try {
     if (exists) {
       await $`git -C ${repoDir} checkout ${branch}`.quiet();
+      return;
+    }
+    if (remoteExists) {
+      await $`git -C ${repoDir} checkout -b ${branch} --track origin/${branch}`.quiet();
       return;
     }
     await $`git -C ${repoDir} checkout -b ${branch}`.quiet();
@@ -194,10 +381,22 @@ async function hasLocalBranch($: Shell, repoDir: string, branch: string): Promis
   }
 }
 
-async function hasRemoteRef($: Shell, repoDir: string, branch: string): Promise<boolean> {
+export async function hasRemoteBranch($: Shell, repoDir: string, branch: string): Promise<boolean> {
   try {
     await $`git -C ${repoDir} show-ref --verify refs/remotes/origin/${branch}`.quiet();
     return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function hasAnyRemoteBranches($: Shell, repoDir: string): Promise<boolean> {
+  try {
+    const output = await $`git -C ${repoDir} for-each-ref refs/remotes/origin`.quiet().text();
+    return output
+      .split('\n')
+      .map((line) => line.trim())
+      .some((line) => Boolean(line) && !line.includes('refs/remotes/origin/HEAD'));
   } catch {
     return false;
   }
@@ -234,8 +433,8 @@ async function getStatusLines($: Shell, repoDir: string): Promise<string[]> {
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error instanceof Error) return redactRemoteCredentials(error.message);
+  return redactRemoteCredentials(String(error));
 }
 
 export async function repoExists($: Shell, repoIdentifier: string): Promise<boolean> {

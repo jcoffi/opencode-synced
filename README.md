@@ -1,6 +1,7 @@
 # opencode-synced
 
-Sync global opencode configuration across machines via a GitHub repo, with optional secrets support for private repos.
+Sync global opencode configuration across machines through Git, with automatic GitHub setup and
+an explicit-URL path for pre-created remotes.
 
 ## Features
 
@@ -14,8 +15,9 @@ Sync global opencode configuration across machines via a GitHub repo, with optio
 
 ## Requirements
 
-- GitHub CLI (`gh`) installed and authenticated (`gh auth login`)
 - Git installed and available on PATH
+- GitHub CLI (`gh`) installed and authenticated (`gh auth login`) when using automatic GitHub
+  creation, discovery, or privacy verification
 
 ## Setup
 
@@ -52,6 +54,32 @@ If auto-detection fails, specify the repo name: `/sync-link my-opencode-config`
 
 After linking, restart opencode to apply the synced settings.
 
+### Pre-created non-GitHub remote
+
+Automatic creation and discovery remain GitHub-only. For GitLab, a self-hosted forge, or another
+Git server, create the remote first and pass its URL explicitly:
+
+```text
+/sync-init ssh://git@git.example.com/team/opencode-config.git
+/sync-link ssh://git@git.example.com/team/opencode-config.git
+```
+
+HTTPS, `ssh://`, SCP-style SSH (`git@host:team/repo.git`), `file://`, and absolute local bare
+repository paths are accepted. `/sync-init <url>` seeds a pre-created empty remote; use
+`/sync-link <url>` for a remote that already contains synced config. Set `repo.branch` explicitly
+when the remote's default branch cannot be detected.
+
+Authentication is delegated to Git. Configure a credential helper or SSH agent; embedded URL
+credentials, query parameters, and fragments are rejected so tokens cannot enter status output,
+logs, Git config, or the synced configuration file. Absolute local remotes are useful for testing
+or same-machine workflows but are not portable across computers.
+
+GitHub repository visibility is verified through `gh`. Other providers do not expose a common
+privacy check, so secrets, prompt history, and sessions fail closed by default. After independently
+confirming the exact remote is private, explicitly acknowledge it when enabling secrets. The
+acknowledgement is fingerprinted in local `sync-state.json`; it is not synced and is invalidated if
+the remote URL changes.
+
 ### Custom repo name or org
 
 You can specify a custom repo name or use an organization:
@@ -68,8 +96,8 @@ Create `~/.config/opencode/opencode-synced.jsonc`:
 ```jsonc
 {
   "repo": {
-    "owner": "your-org",
-    "name": "opencode-config",
+    // Use owner/name for GitHub automation, or url for a pre-created remote.
+    "url": "ssh://git@git.example.com/your-org/opencode-config.git",
     "branch": "main",
   },
   "includeSecrets": false,
@@ -100,7 +128,11 @@ Create `~/.config/opencode/opencode-synced.jsonc`:
 - `~/.config/opencode/agent/`, `command/`, `mode/`, `tool/`, `themes/`, `plugin/`, `skills/`
 - `~/.agents/`
 - `~/.local/state/opencode/model.json` (model favorites)
-- Any additional paths in `extraConfigPaths` (allowlist, files or folders). You do not need to include default paths like `~/.config/opencode/skills` or `~/.agents`.
+- Any additional paths in `extraConfigPaths` (allowlist, files or folders). Relative paths resolve from `$XDG_CONFIG_HOME/opencode` (normally `~/.config/opencode`). You do not need to include default paths like `~/.config/opencode/skills` or `~/.agents`.
+
+`~/.agents/` is enabled by default and may contain instructions or skills you consider private.
+Review it before syncing, keep the sync repository private when needed, or set
+`"includeAgentsDir": false` to opt out.
 
 Disable default directory sync by setting:
 - `"includeOpencodeSkills": false` to skip `~/.config/opencode/skills/`
@@ -112,7 +144,7 @@ Enable secrets with `/sync-enable-secrets` or set `"includeSecrets": true`:
 
 - `~/.local/share/opencode/auth.json`
 - `~/.local/share/opencode/mcp-auth.json`
-- Any extra paths in `extraSecretPaths` (allowlist, files or folders)
+- Any extra paths in `extraSecretPaths` (allowlist, files or folders). Relative paths resolve from `$XDG_CONFIG_HOME/opencode` (normally `~/.config/opencode`).
 
 MCP API keys stored inside `opencode.json(c)` are **not** committed by default. To allow them
 in a private repo, set `"includeMcpSecrets": true` (requires `includeSecrets`).
@@ -152,6 +184,21 @@ Best-effort session artifact sync via Git paths:
 - `~/.local/share/opencode/storage/session_diff/`
 
 This mode can conflict with concurrent writers.
+
+Large `opencode.db` files and legacy files under `storage/message/` are represented as a small,
+versioned pointer plus 40 MiB parts once they exceed 50 MiB. Parts live in the plugin-owned
+`.opencode-synced/chunks/v1/` namespace. Each pointer records the exact part count, total size,
+file mode, and SHA-256 digest; pulls validate the complete representation before atomically replacing
+the local file or database bundle. Readers continue to accept ordinary unchunked session files.
+
+The format rejects symlinks, unknown/missing parts, invalid metadata, files larger than 4 GiB, and
+representations with more than 128 parts. The chunk namespace has a versioned ownership marker, so
+cleanup refuses to touch a colliding or corrupt directory.
+
+If an earlier failed push already committed a file over GitHub's size limit, that blob remains in
+the unpushed commit ancestry even after the working tree is chunked. `opencode-synced` detects this
+and stops instead of rewriting history automatically. The error includes exact commands that first
+create a backup branch and then rebuild only the unpushed commits from the remote branch.
 
 #### Turso backend (`sessionBackend.type = "turso"`)
 

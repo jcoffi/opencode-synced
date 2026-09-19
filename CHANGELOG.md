@@ -2,6 +2,99 @@
 
 All notable changes to this project will be documented here by Release Please.
 
+## [0.10.1](https://github.com/iHildy/opencode-synced/compare/v0.10.0...v0.10.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* preserve release version in smoke workflow ([PR #79](https://github.com/iHildy/opencode-synced/pull/79)) ([22ef5c1](https://github.com/iHildy/opencode-synced/commit/22ef5c17fcbd9a445229ca78b80a80bdb88bdc1d))
+* unblock release publication workflows ([PR #77](https://github.com/iHildy/opencode-synced/pull/77)) ([7b93df6](https://github.com/iHildy/opencode-synced/commit/7b93df6d9a0d4f715956e01bad453d3a7f44fe37))
+
+## [0.10.0](https://github.com/iHildy/opencode-synced/compare/v0.9.0...v0.10.0) (2026-08-31)
+
+This release substantially expands what can be synced and how safely it can move between
+machines. It also adds isolated end-to-end coverage for the supported workflows.
+
+### Secrets and private configuration
+
+* Add a 1Password-backed secrets store, machine-local backend configuration, and
+  `sync-secrets-pull`, `sync-secrets-push`, and `sync-secrets-status` commands. Auth files stay
+  out of Git when the backend is enabled, backend actions validate before running, and original
+  1Password errors remain available for diagnosis. See [PR #35](https://github.com/iHildy/opencode-synced/pull/35)
+  and [issue #34](https://github.com/iHildy/opencode-synced/issues/34).
+* Resolve `{env:VAR}` placeholders from local overrides at runtime without writing resolved
+  credentials to the sync repository or logs. Missing variables, malformed credentials, and
+  unsafe keys fail closed, while secret-bearing override files use mode `0600`. See
+  [PR #47](https://github.com/iHildy/opencode-synced/pull/47) and
+  [issue #44](https://github.com/iHildy/opencode-synced/issues/44).
+* Strip local-only override keys even when the base repository config contains the same key, so
+  pushes no longer restore values that should remain machine-local. See
+  [PR #50](https://github.com/iHildy/opencode-synced/pull/50) and
+  [issue #49](https://github.com/iHildy/opencode-synced/issues/49).
+
+### Sessions and storage
+
+* Support both OpenCode's SQLite session database and legacy session directories, including
+  SQLite sidecars, preserve-on-missing behavior, restart guidance after pull, and feature-specific
+  E2E coverage. See [PR #53](https://github.com/iHildy/opencode-synced/pull/53).
+* Add an opt-in Turso session backend for concurrent-safe multi-machine sync, with setup,
+  migration, backend-selection, and Git-cleanup commands. Git remains the default backend. See
+  [PR #54](https://github.com/iHildy/opencode-synced/pull/54).
+* Make repository selection deterministic during link and Turso E2E flows, while accepting
+  explicit GitHub HTTPS and SSH references. See [PR #55](https://github.com/iHildy/opencode-synced/pull/55).
+* Chunk session files larger than 50 MiB into validated, content-addressed parts. Database bundles
+  install atomically, corrupt or unsafe pointers fail closed, and oversized blobs in unpushed Git
+  history produce backup and recovery instructions instead of rewriting history automatically.
+  See [PR #76](https://github.com/iHildy/opencode-synced/pull/76) and
+  [issue #45](https://github.com/iHildy/opencode-synced/issues/45).
+
+### Sync coverage and portability
+
+* Sync `~/.config/opencode/skills/` by default and deduplicate it from extra paths. See
+  [PR #56](https://github.com/iHildy/opencode-synced/pull/56) and
+  [issue #40](https://github.com/iHildy/opencode-synced/issues/40).
+* Sync `~/.agents/` by default, with `includeAgentsDir: false` as an opt-out. This directory can
+  contain private instructions or skills, so users should review it before syncing to a shared
+  repository. See [PR #57](https://github.com/iHildy/opencode-synced/pull/57).
+* Sync canonical plural OpenCode directories such as `agents/`, `commands/`, `modes/`, `plugins/`,
+  and `tools/`, while keeping legacy singular directories compatible. See
+  [PR #71](https://github.com/iHildy/opencode-synced/pull/71) and
+  [issue #67](https://github.com/iHildy/opencode-synced/issues/67).
+* Resolve relative extra config and secret paths from the OpenCode config root instead of the
+  process working directory. Preserve absolute and home-relative behavior, exact allowlists, and
+  repository containment. See [PR #72](https://github.com/iHildy/opencode-synced/pull/72) and
+  [issue #43](https://github.com/iHildy/opencode-synced/issues/43).
+* Store extra-path manifests in a portable form across different homes and operating systems,
+  accept legacy Windows separators, and reject repository paths that escape the sync checkout.
+  See [PR #58](https://github.com/iHildy/opencode-synced/pull/58).
+* Use current OpenCode config, data, and state paths on Windows, honor explicit XDG overrides, and
+  verify path behavior on a real Windows runner. See
+  [PR #74](https://github.com/iHildy/opencode-synced/pull/74) and
+  [issue #59](https://github.com/iHildy/opencode-synced/issues/59).
+* Support pre-created HTTPS, SSH, SCP-style, `file://`, and absolute local Git remotes. Generic
+  remotes reject embedded credentials, redact user info, validate branches, and require a
+  machine-local privacy acknowledgement before syncing sensitive data. See
+  [PR #73](https://github.com/iHildy/opencode-synced/pull/73) and
+  [issue #61](https://github.com/iHildy/opencode-synced/issues/61).
+* Sync `opencode-synced.jsonc` as a core config item and deduplicate it from extra paths.
+* Preserve nested model IDs in `small_model` selectors while retaining invalid-selector handling
+  and fallback to `model`. See [PR #70](https://github.com/iHildy/opencode-synced/pull/70) and
+  [issue #69](https://github.com/iHildy/opencode-synced/issues/69).
+
+### Testing, documentation, and releases
+
+* Add an isolated two-instance GitHub E2E system with per-run HOME and XDG sandboxes, dynamic
+  ports, exact plugin packaging, strict cleanup, parallel-run safety, and feature variants for
+  sessions and secrets. See [PR #52](https://github.com/iHildy/opencode-synced/pull/52).
+* Expand the README and dedicated 1Password documentation for secrets, session backends,
+  migration, restart behavior, default synced directories, privacy controls, and non-GitHub
+  remotes.
+* Harden release publication around canonical commit SHAs, exact packed artifacts, pre-publish and
+  post-publish smoke tests, OIDC-only npm publication, immutable prerelease versions, pinned
+  actions, and frozen dependency setup. See [PR #75](https://github.com/iHildy/opencode-synced/pull/75).
+* Keep the moving `latest` Git tag on the newest stable release. See
+  [PR #36](https://github.com/iHildy/opencode-synced/pull/36).
+
 ## [0.9.0](https://github.com/iHildy/opencode-synced/compare/v0.8.0...v0.9.0) (2026-01-29)
 
 

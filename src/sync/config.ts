@@ -87,6 +87,10 @@ export interface SyncState {
   lastSecretsHash?: string;
   lastSessionPull?: string;
   lastSessionPush?: string;
+  privateRemoteAcknowledgement?: {
+    remoteFingerprint: string;
+    acknowledgedAt: string;
+  };
 }
 
 export async function pathExists(filePath: string): Promise<boolean> {
@@ -188,7 +192,74 @@ export function normalizeSyncConfig(config: SyncConfig): NormalizedSyncConfig {
     extraSecretPaths: Array.isArray(config.extraSecretPaths) ? config.extraSecretPaths : [],
     extraConfigPaths: Array.isArray(config.extraConfigPaths) ? config.extraConfigPaths : [],
     localRepoPath: config.localRepoPath,
-    repo: config.repo,
+    repo: normalizeRepoConfig(config.repo),
+  };
+}
+
+export function sanitizeRepoUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return trimmed;
+  if (
+    [...trimmed].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    })
+  ) {
+    throw new Error('Repo URL must not contain control characters.');
+  }
+  if (path.isAbsolute(trimmed) || path.win32.isAbsolute(trimmed)) {
+    return trimmed;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    if (/^[^@\s]+@[^:\s]+:.+$/u.test(trimmed)) {
+      return trimmed;
+    }
+    throw new Error(
+      'Repo URL must be an HTTPS, SSH, Git, file URL, SCP-style SSH remote, or absolute path.'
+    );
+  }
+
+  if (!['http:', 'https:', 'ssh:', 'git:', 'file:'].includes(parsed.protocol)) {
+    throw new Error('Repo URL uses an unsupported protocol.');
+  }
+
+  if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error(
+        'Repo URL must not contain embedded credentials, query parameters, or fragments. ' +
+          'Configure authentication through Git instead.'
+      );
+    }
+    return parsed.toString();
+  }
+
+  if (parsed.password || parsed.search || parsed.hash) {
+    throw new Error(
+      'Repo URL must not contain embedded passwords, query parameters, or fragments. ' +
+        'Configure authentication through Git instead.'
+    );
+  }
+  return parsed.toString();
+}
+
+function normalizeRepoConfig(input: SyncConfig['repo']): SyncRepoConfig | undefined {
+  if (!input) return undefined;
+
+  if (typeof input.url === 'string') {
+    return {
+      url: sanitizeRepoUrl(input.url),
+      branch: typeof input.branch === 'string' ? input.branch : undefined,
+    };
+  }
+
+  return {
+    owner: typeof input.owner === 'string' ? input.owner : undefined,
+    name: typeof input.name === 'string' ? input.name : undefined,
+    branch: typeof input.branch === 'string' ? input.branch : undefined,
   };
 }
 
@@ -225,8 +296,12 @@ export async function loadOverrides(
     return null;
   }
 
+  await chmodIfExists(locations.overridesPath, 0o600);
   const content = await fs.readFile(locations.overridesPath, 'utf8');
-  const parsed = parseJsonc<Record<string, unknown>>(content);
+  const parsed = parseJsonc<unknown>(content);
+  if (!isPlainObject(parsed)) {
+    throw new Error(`Local overrides file must contain a JSON object: ${locations.overridesPath}`);
+  }
   return parsed;
 }
 
@@ -252,15 +327,75 @@ export async function updateState(
   await writeState(locations, { ...existing, ...update });
 }
 
+export class EnvPlaceholderResolutionError extends Error {
+  constructor(
+    message: string,
+    readonly fieldPath: readonly string[] = []
+  ) {
+    super(message);
+    this.name = 'EnvPlaceholderResolutionError';
+  }
+}
+
 export function applyOverridesToRuntimeConfig(
   config: Record<string, unknown>,
-  overrides: Record<string, unknown>
+  overrides: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env
 ): void {
-  const merged = deepMerge(config, overrides) as Record<string, unknown>;
-  for (const key of Object.keys(config)) {
-    delete config[key];
+  const resolvedOverrides = resolveEnvPlaceholders(overrides, env);
+  const merged = deepMerge(config, resolvedOverrides) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(merged)) {
+    defineOwnValue(config, key, value);
   }
-  Object.assign(config, merged);
+}
+
+export function resolveEnvPlaceholders(
+  value: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+  fieldPath: readonly string[] = ['overrides']
+): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\{env:([^}]+)\}/g, (_match, envVar: string) => {
+      const resolved = env[envVar];
+      const displayPath = formatFieldPath(fieldPath);
+      if (resolved === undefined) {
+        throw new EnvPlaceholderResolutionError(
+          `Missing environment variable "${envVar}" required by local override "${displayPath}".`,
+          fieldPath
+        );
+      }
+      if (resolved.length === 0) {
+        throw new EnvPlaceholderResolutionError(
+          `Environment variable "${envVar}" required by local override "${displayPath}" is empty.`,
+          fieldPath
+        );
+      }
+      return resolved;
+    });
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item, index) =>
+      resolveEnvPlaceholders(item, env, [...fieldPath, `${index}`])
+    );
+  }
+
+  if (isPlainObject(value)) {
+    const result: Record<string, unknown> = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+      const nestedPath = [...fieldPath, key];
+      if (key === '__proto__') {
+        throw new EnvPlaceholderResolutionError(
+          `Unsafe local override field "${formatFieldPath(nestedPath)}" is not allowed.`,
+          nestedPath
+        );
+      }
+      defineOwnValue(result, key, resolveEnvPlaceholders(nestedValue, env, nestedPath));
+    }
+    return result;
+  }
+
+  return value;
 }
 
 export function deepMerge<T>(base: T, override: unknown): T {
@@ -270,13 +405,33 @@ export function deepMerge<T>(base: T, override: unknown): T {
 
   const result: Record<string, unknown> = { ...(base as Record<string, unknown>) };
   for (const [key, value] of Object.entries(override as Record<string, unknown>)) {
-    if (isPlainObject(value) && isPlainObject(result[key])) {
-      result[key] = deepMerge(result[key], value);
-    } else {
-      result[key] = value;
-    }
+    const currentValue = hasOwn(result, key) ? result[key] : undefined;
+    const mergedValue =
+      isPlainObject(value) && isPlainObject(currentValue) ? deepMerge(currentValue, value) : value;
+    defineOwnValue(result, key, mergedValue);
   }
   return result as T;
+}
+
+function formatFieldPath(fieldPath: readonly string[]): string {
+  let result = fieldPath[0] ?? '';
+  for (const key of fieldPath.slice(1)) {
+    if (/^(0|[1-9][0-9]*)$/u.test(key)) {
+      result += `[${key}]`;
+      continue;
+    }
+    result += /^[a-zA-Z_$][a-zA-Z0-9_$]*$/u.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+  }
+  return result;
+}
+
+function defineOwnValue(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }
 
 export function stripOverrides(
@@ -308,7 +463,7 @@ export function stripOverrides(
       continue;
     }
 
-    if (baseValue === undefined) {
+    if (currentValue === undefined || baseValue === undefined) {
       delete result[key];
     } else {
       result[key] = baseValue;
@@ -403,7 +558,11 @@ export async function writeJsonFile(
 ): Promise<void> {
   const json = JSON.stringify(data, null, 2);
   const content = options.jsonc ? `// Generated by opencode-synced\n${json}\n` : `${json}\n`;
-  await fs.writeFile(filePath, content, 'utf8');
+  if (options.mode === undefined) {
+    await fs.writeFile(filePath, content, 'utf8');
+  } else {
+    await fs.writeFile(filePath, content, { encoding: 'utf8', mode: options.mode });
+  }
   if (options.mode !== undefined) {
     await chmodIfExists(filePath, options.mode);
   }

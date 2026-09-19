@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
@@ -28,10 +29,17 @@ import {
   findSyncRepo,
   getAuthenticatedUser,
   getRepoStatus,
+  hasAnyRemoteBranches,
   hasLocalChanges,
+  hasRemoteBranch,
+  inspectOversizedUnpushedHistory,
+  isExplicitGitRemote,
+  isGitHubRepoConfig,
   isRepoCloned,
   parseRepoReference,
   pushBranch,
+  redactRemoteCredentials,
+  redactRepoUrl,
   repoExists,
   resolveRepoBranch,
   resolveRepoIdentifier,
@@ -81,10 +89,13 @@ interface InitOptions {
   extraSecretPaths?: string[];
   extraConfigPaths?: string[];
   localRepoPath?: string;
+  acknowledgePrivateRemote?: boolean;
 }
 
 interface LinkOptions {
   repo?: string;
+  branch?: string;
+  acknowledgePrivateRemote?: boolean;
 }
 
 export interface SyncService {
@@ -101,6 +112,7 @@ export interface SyncService {
   enableSecrets: (_options?: {
     extraSecretPaths?: string[];
     includeMcpSecrets?: boolean;
+    acknowledgePrivateRemote?: boolean;
   }) => Promise<string>;
   sessionsBackend: (_options: {
     backend?: 'git' | 'turso';
@@ -253,6 +265,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
     { backend: SecretsBackend } | { message: string }
   > => {
     const config = await getConfigOrThrow(locations);
+    await ensureSensitiveSyncPolicy(ctx, locations, config);
     const resolution = resolveSecretsBackendConfig(config);
     if (resolution.state === 'none') {
       return {
@@ -618,6 +631,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
         }
         try {
           assertValidSecretsBackend(config);
+          await ensureSensitiveSyncPolicy(ctx, locations, config);
           let tursoWarning: string | null = null;
           if (isTursoSessionBackend(config)) {
             try {
@@ -736,18 +750,34 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
 
         const repoIdentifier = resolveRepoIdentifier(config);
         const isPrivate = options.private ?? true;
+        const explicitRemote = Boolean(config.repo?.url);
 
-        const exists = await repoExists(ctx.$, repoIdentifier);
         let created = false;
-        if (!exists) {
-          await createRepo(ctx.$, config, isPrivate);
-          created = true;
+        if (!explicitRemote) {
+          const exists = await repoExists(ctx.$, repoIdentifier);
+          if (!exists) {
+            await createRepo(ctx.$, config, isPrivate);
+            created = true;
+          }
         }
 
-        await writeSyncConfig(locations, config);
         const repoRoot = resolveRepoRoot(config, locations);
         await ensureRepoCloned(ctx.$, config, repoRoot);
-        await ensureSecretsPolicy(ctx, config);
+        const branch = await resolveBranch(ctx, config, repoRoot);
+        await fetchAndFastForward(ctx.$, repoRoot, branch);
+        config.repo = { ...config.repo, branch };
+
+        if (explicitRemote && (await hasAnyRemoteBranches(ctx.$, repoRoot))) {
+          throw new SyncCommandError(
+            'The explicit Git remote already contains a branch. Use /sync-link <url> instead.'
+          );
+        }
+        await writeSyncConfig(locations, config);
+
+        if (options.acknowledgePrivateRemote === true) {
+          await acknowledgePrivateRemote(locations, config);
+        }
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
 
         const initNotes: string[] = [];
         if (isTursoSessionBackend(config) && options.setupTurso !== false) {
@@ -768,17 +798,19 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           initNotes.push(`Session bootstrap: ${cycle.summary}`);
         }
 
-        if (created) {
+        const shouldBootstrap =
+          created || (explicitRemote && !(await hasRemoteBranch(ctx.$, repoRoot, branch)));
+        if (shouldBootstrap) {
           const overrides = await loadOverrides(locations);
           const plan = buildSyncPlan(config, locations, repoRoot);
           await syncLocalToRepo(plan, overrides, {
             overridesPath: locations.overridesPath,
             allowMcpSecrets: canCommitMcpSecrets(config),
           });
+          await assertNoOversizedUnpushedHistory(ctx.$, repoRoot, branch);
 
           const dirty = await hasLocalChanges(ctx.$, repoRoot);
           if (dirty) {
-            const branch = resolveRepoBranch(config);
             await commitAll(ctx.$, repoRoot, 'Initial sync from opencode-synced');
             await pushBranch(ctx.$, repoRoot, branch);
             await updateState(locations, { lastPush: new Date().toISOString() });
@@ -788,7 +820,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
         const lines = [
           'opencode-synced configured.',
           `Repo: ${repoIdentifier}${created ? ' (created)' : ''}`,
-          `Branch: ${resolveRepoBranch(config)}`,
+          `Branch: ${branch}`,
           `Local repo: ${repoRoot}`,
         ];
         if (initNotes.length > 0) {
@@ -811,57 +843,80 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           );
         }
 
-        const found = await findSyncRepo(ctx.$, options.repo, {
-          disableAutoDiscovery: disableAutoRepoDiscovery,
-        });
+        const explicitRemote = options.repo ? isExplicitGitRemote(options.repo) : false;
+        let config: NormalizedSyncConfig;
+        let repoDisplay: string;
+        let remotePrivacy: 'private' | 'public' | 'unverified';
 
-        if (!found) {
-          const searchedFor = options.repo
-            ? `"${options.repo}"`
-            : disableAutoRepoDiscovery
-              ? '(none; auto-discovery disabled)'
-              : 'common sync repo names (my-opencode-config, opencode-config, etc.)';
+        if (explicitRemote && options.repo) {
+          config = normalizeSyncConfig({
+            repo: { url: options.repo, branch: options.branch },
+            includeSecrets: false,
+            includeMcpSecrets: false,
+            includeSessions: false,
+            includePromptStash: false,
+            extraSecretPaths: [],
+            extraConfigPaths: [],
+          });
+          repoDisplay = redactRepoUrl(options.repo);
+          remotePrivacy = 'unverified';
+        } else {
+          const found = await findSyncRepo(ctx.$, options.repo, {
+            disableAutoDiscovery: disableAutoRepoDiscovery,
+          });
 
-          const lines = [
-            `Could not find an existing sync repo. Searched for: ${searchedFor}`,
-            '',
-            'To link to an existing repo, run:',
-            '  /sync-link <owner/repo>',
-            '',
-            'To create a new sync repo, run:',
-            '  /sync-init',
-          ];
-          return lines.join('\n');
-        }
+          if (!found) {
+            const searchedFor = options.repo
+              ? `"${redactRemoteCredentials(options.repo)}"`
+              : disableAutoRepoDiscovery
+                ? '(none; auto-discovery disabled)'
+                : 'common sync repo names (my-opencode-config, opencode-config, etc.)';
 
-        if (strictLinkRepo) {
-          const linkedIdentifier = `${found.owner}/${found.name}`.toLowerCase();
-          const expectedIdentifier = `${strictLinkRepo.owner}/${strictLinkRepo.name}`.toLowerCase();
-          if (linkedIdentifier !== expectedIdentifier) {
-            throw new SyncCommandError(
-              `Strict link mode expected repo ${strictLinkRepo.owner}/${strictLinkRepo.name}, ` +
-                `but resolved ${found.owner}/${found.name}.`
-            );
+            const lines = [
+              `Could not find an existing sync repo. Searched for: ${searchedFor}`,
+              '',
+              'To link to an existing repo, run:',
+              '  /sync-link <owner/repo-or-url>',
+              '',
+              'To create a new GitHub sync repo, run:',
+              '  /sync-init',
+            ];
+            return lines.join('\n');
           }
-        }
 
-        const config = normalizeSyncConfig({
-          repo: { owner: found.owner, name: found.name },
-          includeSecrets: false,
-          includeMcpSecrets: false,
-          includeSessions: false,
-          includePromptStash: false,
-          extraSecretPaths: [],
-          extraConfigPaths: [],
-        });
+          if (strictLinkRepo) {
+            const linkedIdentifier = `${found.owner}/${found.name}`.toLowerCase();
+            const expectedIdentifier =
+              `${strictLinkRepo.owner}/${strictLinkRepo.name}`.toLowerCase();
+            if (linkedIdentifier !== expectedIdentifier) {
+              throw new SyncCommandError(
+                `Strict link mode expected repo ${strictLinkRepo.owner}/${strictLinkRepo.name}, ` +
+                  `but resolved ${found.owner}/${found.name}.`
+              );
+            }
+          }
+
+          config = normalizeSyncConfig({
+            repo: { owner: found.owner, name: found.name, branch: options.branch },
+            includeSecrets: false,
+            includeMcpSecrets: false,
+            includeSessions: false,
+            includePromptStash: false,
+            extraSecretPaths: [],
+            extraConfigPaths: [],
+          });
+          repoDisplay = `${found.owner}/${found.name}`;
+          remotePrivacy = found.isPrivate ? 'private' : 'public';
+        }
 
         await writeSyncConfig(locations, config);
         const repoRoot = resolveRepoRoot(config, locations);
         await ensureRepoCloned(ctx.$, config, repoRoot);
 
         const branch = await resolveBranch(ctx, config, repoRoot);
-
         await fetchAndFastForward(ctx.$, repoRoot, branch);
+        config.repo = { ...config.repo, branch };
+        await writeSyncConfig(locations, config);
 
         const overrides = await loadOverrides(locations);
         const plan = buildSyncPlan(config, locations, repoRoot);
@@ -874,6 +929,14 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
 
         const linkNotes: string[] = [];
         const syncedConfig = await loadSyncConfig(locations);
+        if (syncedConfig) {
+          syncedConfig.repo = { ...config.repo, branch };
+          await writeSyncConfig(locations, syncedConfig);
+          if (options.acknowledgePrivateRemote === true) {
+            await acknowledgePrivateRemote(locations, syncedConfig);
+          }
+          await ensureSensitiveSyncPolicy(ctx, locations, syncedConfig);
+        }
         if (syncedConfig && isTursoSessionBackend(syncedConfig)) {
           const setup = await runTursoSetup(syncedConfig, { allowLogin: true });
           linkNotes.push(setup.message);
@@ -889,16 +952,18 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
         }
 
         const lines = [
-          `Linked to existing sync repo: ${found.owner}/${found.name}`,
+          `Linked to existing sync repo: ${repoDisplay}`,
           '',
           'Your local opencode config has been OVERWRITTEN with the synced config.',
           'Your local overrides file was preserved and applied on top.',
           '',
           'Restart opencode to apply the new settings.',
           '',
-          found.isPrivate
+          remotePrivacy === 'private'
             ? 'To enable secrets sync, run: /sync-enable-secrets'
-            : 'Note: Repo is public. Secrets sync is disabled.',
+            : remotePrivacy === 'public'
+              ? 'Note: Repo is public. Secrets sync is disabled.'
+              : 'Remote privacy was not verified. Secrets sync requires an explicit private-remote acknowledgement.',
         ];
         if (linkNotes.length > 0) {
           lines.push('', ...linkNotes);
@@ -912,7 +977,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
         const config = await getConfigOrThrow(locations);
         const repoRoot = resolveRepoRoot(config, locations);
         await ensureRepoCloned(ctx.$, config, repoRoot);
-        await ensureSecretsPolicy(ctx, config);
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         await ensureAuthFilesNotTracked(repoRoot, config);
 
         const branch = await resolveBranch(ctx, config, repoRoot);
@@ -961,7 +1026,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
         const config = await getConfigOrThrow(locations);
         const repoRoot = resolveRepoRoot(config, locations);
         await ensureRepoCloned(ctx.$, config, repoRoot);
-        await ensureSecretsPolicy(ctx, config);
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         await ensureAuthFilesNotTracked(repoRoot, config);
         const branch = await resolveBranch(ctx, config, repoRoot);
 
@@ -978,6 +1043,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           overridesPath: locations.overridesPath,
           allowMcpSecrets: canCommitMcpSecrets(config),
         });
+        await assertNoOversizedUnpushedHistory(ctx.$, repoRoot, branch);
 
         const dirty = await hasLocalChanges(ctx.$, repoRoot);
         if (!dirty) {
@@ -1062,7 +1128,11 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           return await backend.status();
         })
       ),
-    enableSecrets: (options?: { extraSecretPaths?: string[]; includeMcpSecrets?: boolean }) =>
+    enableSecrets: (options?: {
+      extraSecretPaths?: string[];
+      includeMcpSecrets?: boolean;
+      acknowledgePrivateRemote?: boolean;
+    }) =>
       runExclusive(async () => {
         const config = await getConfigOrThrow(locations);
         config.includeSecrets = true;
@@ -1073,7 +1143,10 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           config.includeMcpSecrets = options.includeMcpSecrets;
         }
 
-        await ensureRepoPrivate(ctx.$, config);
+        if (options?.acknowledgePrivateRemote === true) {
+          await acknowledgePrivateRemote(locations, config);
+        }
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         await writeSyncConfig(locations, config);
 
         return 'Secrets sync enabled for this repo.';
@@ -1103,6 +1176,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
             type: backend,
           },
         });
+        await ensureSensitiveSyncPolicy(ctx, locations, nextConfig);
 
         const notes: string[] = [];
         if (backend === 'turso') {
@@ -1144,6 +1218,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
     sessionsSetupTurso: (options?: { forceTokenRefresh?: boolean }) =>
       runExclusive(async () => {
         const config = await getConfigOrThrow(locations);
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         if (!config.includeSessions) {
           throw new SyncCommandError(
             'Session sync is disabled. Enable includeSessions=true before Turso setup.'
@@ -1182,6 +1257,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
     sessionsMigrateTurso: (options?: { setupTurso?: boolean }) =>
       runExclusive(async () => {
         const config = await getConfigOrThrow(locations);
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         if (!config.includeSessions) {
           throw new SyncCommandError(
             'Session sync is disabled. Enable includeSessions=true before migration.'
@@ -1231,6 +1307,7 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
     sessionsCleanupGit: () =>
       runExclusive(async () => {
         const config = await getConfigOrThrow(locations);
+        await ensureSensitiveSyncPolicy(ctx, locations, config);
         if (!isTursoSessionBackend(config)) {
           throw new SyncCommandError(
             'Cleanup is only available when includeSessions=true and sessionBackend=turso.'
@@ -1261,12 +1338,18 @@ export function createSyncService(ctx: SyncServiceContext): SyncService {
           await fs.rm(target, { recursive: true, force: true });
         }
 
+        const branch = await resolveBranch(ctx, config, repoRoot);
+        await assertNoOversizedUnpushedHistory(
+          ctx.$,
+          repoRoot,
+          branch,
+          'The working tree has removed the deprecated Git session paths.'
+        );
         const dirty = await hasLocalChanges(ctx.$, repoRoot);
         if (!dirty) {
           return 'No deprecated Git session artifacts were found.';
         }
 
-        const branch = await resolveBranch(ctx, config, repoRoot);
         await commitAll(ctx.$, repoRoot, 'chore: remove deprecated git session artifacts');
         await pushBranch(ctx.$, repoRoot, branch);
         await updateState(locations, { lastPush: new Date().toISOString() });
@@ -1350,7 +1433,7 @@ async function runStartup(
   log.debug('Starting sync', { repoRoot });
 
   await ensureRepoCloned(ctx.$, config, repoRoot);
-  await ensureSecretsPolicy(ctx, config);
+  await ensureSensitiveSyncPolicy(ctx, locations, config);
   await options.ensureAuthFilesNotTracked(repoRoot, config);
   const branch = await resolveBranch(ctx, config, repoRoot);
   log.debug('Resolved branch', { branch });
@@ -1387,6 +1470,7 @@ async function runStartup(
     overridesPath: locations.overridesPath,
     allowMcpSecrets: canCommitMcpSecrets(config),
   });
+  await assertNoOversizedUnpushedHistory(ctx.$, repoRoot, branch);
   const changes = await hasLocalChanges(ctx.$, repoRoot);
   if (!changes) {
     log.debug('No local changes to push');
@@ -1402,6 +1486,61 @@ async function runStartup(
   });
 }
 
+async function assertNoOversizedUnpushedHistory(
+  $: Shell,
+  repoRoot: string,
+  branch: string,
+  preparedMessage = 'The working tree already contains the safe chunk representation.'
+): Promise<void> {
+  const inspection = await inspectOversizedUnpushedHistory($, repoRoot, branch);
+  if (inspection.oversizedPaths.length === 0) return;
+
+  const backupBranch = `opencode-synced-oversized-backup-${Date.now()}`;
+  const paths = inspection.oversizedPaths.map((filePath) => `  - ${filePath}`).join('\n');
+  const unsupportedPaths = inspection.oversizedPaths.filter(
+    (filePath) =>
+      !['data/opencode.db', 'data/opencode.db-wal', 'data/opencode.db-shm'].includes(filePath) &&
+      !filePath.startsWith('data/storage/message/')
+  );
+  const commands = inspection.remoteExists
+    ? [
+        `cd ${shellQuoteForInstructions(repoRoot)}`,
+        `git branch ${backupBranch}`,
+        `git reset --soft origin/${branch}`,
+        'git add -A',
+        'git commit -m "fix: recover chunked session files"',
+        `git push -u origin ${branch}`,
+      ]
+    : [
+        `cd ${shellQuoteForInstructions(repoRoot)}`,
+        `git branch ${backupBranch}`,
+        `git checkout --orphan ${branch}-recovered`,
+        'git add -A',
+        'git commit -m "fix: recover chunked session files"',
+        `git branch -M ${branch}`,
+        `git push -u origin ${branch}`,
+      ];
+  throw new SyncCommandError(
+    [
+      'Push stopped: unpushed commits still contain oversized Git blobs:',
+      paths,
+      '',
+      'opencode-synced will not rewrite local history automatically.',
+      unsupportedPaths.length === 0
+        ? preparedMessage
+        : `Before rebuilding, replace or remove these unsupported oversized working-tree paths: ${unsupportedPaths.join(', ')}`,
+      'To retain an exact backup and rebuild only the unpushed commits, review and run:',
+      ...commands.map((command) => `  ${command}`),
+      '',
+      `The original history remains available on branch ${backupBranch}.`,
+    ].join('\n')
+  );
+}
+
+function shellQuoteForInstructions(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 async function getConfigOrThrow(
   locations: ReturnType<typeof resolveSyncLocations>
 ): Promise<ReturnType<typeof normalizeSyncConfig>> {
@@ -1415,12 +1554,57 @@ async function getConfigOrThrow(
   return config;
 }
 
-async function ensureSecretsPolicy(
+async function ensureSensitiveSyncPolicy(
   ctx: SyncServiceContext,
+  locations: ReturnType<typeof resolveSyncLocations>,
   config: ReturnType<typeof normalizeSyncConfig>
-) {
-  if (!config.includeSecrets) return;
-  await ensureRepoPrivate(ctx.$, config);
+): Promise<void> {
+  if (!hasSensitiveSync(config)) return;
+  if (isGitHubRepoConfig(config)) {
+    await ensureRepoPrivate(ctx.$, config);
+    return;
+  }
+
+  const expectedFingerprint = resolvePrivateRemoteFingerprint(config);
+  const state = await loadState(locations);
+  if (state.privateRemoteAcknowledgement?.remoteFingerprint === expectedFingerprint) {
+    return;
+  }
+  throw new SyncCommandError(
+    'Sensitive sync for this non-GitHub remote is blocked because privacy cannot be verified. ' +
+      'Confirm the remote is private, then explicitly acknowledge it for this machine.'
+  );
+}
+
+function hasSensitiveSync(config: NormalizedSyncConfig): boolean {
+  return Boolean(
+    config.includeSecrets ||
+      config.includeMcpSecrets ||
+      config.includeSessions ||
+      config.includePromptStash
+  );
+}
+
+async function acknowledgePrivateRemote(
+  locations: ReturnType<typeof resolveSyncLocations>,
+  config: NormalizedSyncConfig
+): Promise<void> {
+  if (isGitHubRepoConfig(config)) return;
+  const remoteFingerprint = resolvePrivateRemoteFingerprint(config);
+  await updateState(locations, {
+    privateRemoteAcknowledgement: {
+      remoteFingerprint,
+      acknowledgedAt: new Date().toISOString(),
+    },
+  });
+}
+
+function resolvePrivateRemoteFingerprint(config: NormalizedSyncConfig): string {
+  const remote = config.repo?.url;
+  if (!remote) {
+    throw new SyncCommandError('Private-remote acknowledgement requires an explicit repo URL.');
+  }
+  return crypto.createHash('sha256').update(remote).digest('hex');
 }
 
 async function resolveBranch(
@@ -1468,7 +1652,7 @@ async function resolveRepoFromInit($: Shell, options: InitOptions) {
     return { owner: options.owner, name: options.name, branch: options.branch };
   }
   if (options.repo) {
-    if (options.repo.includes('://') || options.repo.endsWith('.git')) {
+    if (isExplicitGitRemote(options.repo)) {
       return { url: options.repo, branch: options.branch };
     }
     if (options.repo.includes('/')) {
@@ -1508,8 +1692,8 @@ async function createRepo(
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error instanceof Error) return redactRemoteCredentials(error.message);
+  return redactRemoteCredentials(String(error));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,6 +1,12 @@
-import { promises as fs } from 'node:fs';
+import crypto from 'node:crypto';
+import { promises as fs, type Stats } from 'node:fs';
 import path from 'node:path';
-
+import {
+  type ChunkOptions,
+  cleanupUnreferencedChunkStores,
+  copySessionFileFromRepo,
+  copySessionFileToRepo,
+} from './chunks.js';
 import {
   chmodIfExists,
   deepMerge,
@@ -17,7 +23,7 @@ import {
   stripOverrideKeys,
 } from './mcp-secrets.js';
 import type { ExtraPathPlan, SyncItem, SyncPlan } from './paths.js';
-import { normalizePath } from './paths.js';
+import { fromPortablePath, normalizePath, toPortablePath } from './paths.js';
 
 type ExtraPathType = 'file' | 'dir';
 
@@ -44,9 +50,14 @@ interface ExtraPathManifest {
 
 export async function syncRepoToLocal(
   plan: SyncPlan,
-  overrides: Record<string, unknown> | null
+  overrides: Record<string, unknown> | null,
+  options: { chunkOptions?: ChunkOptions } = {}
 ): Promise<void> {
   for (const item of plan.items) {
+    if (item.chunkLargeFiles) {
+      await copyChunkableItemFromRepo(item, plan.repoRoot, options.chunkOptions);
+      continue;
+    }
     await copyItem(item.repoPath, item.localPath, item.type);
   }
 
@@ -61,7 +72,11 @@ export async function syncRepoToLocal(
 export async function syncLocalToRepo(
   plan: SyncPlan,
   overrides: Record<string, unknown> | null,
-  options: { overridesPath?: string; allowMcpSecrets?: boolean } = {}
+  options: {
+    overridesPath?: string;
+    allowMcpSecrets?: boolean;
+    chunkOptions?: ChunkOptions;
+  } = {}
 ): Promise<void> {
   const configItems = plan.items.filter((item) => item.isConfigFile);
   const sanitizedConfigs = new Map<string, Record<string, unknown>>();
@@ -88,7 +103,10 @@ export async function syncLocalToRepo(
       const baseOverrides = overrides ?? {};
       const mergedOverrides = mergeOverrides(baseOverrides, secretOverrides);
       if (options.overridesPath && !isDeepEqual(baseOverrides, mergedOverrides)) {
-        await writeJsonFile(options.overridesPath, mergedOverrides, { jsonc: true });
+        await writeJsonFile(options.overridesPath, mergedOverrides, {
+          jsonc: true,
+          mode: 0o600,
+        });
       }
     }
     overridesForStrip = overrides ? stripOverrideKeys(overrides, secretOverrides) : overrides;
@@ -103,11 +121,286 @@ export async function syncLocalToRepo(
       continue;
     }
 
+    if (item.chunkLargeFiles) {
+      await copyChunkableItemToRepo(item, plan.repoRoot, options.chunkOptions);
+      continue;
+    }
+
     await copyItem(item.localPath, item.repoPath, item.type, !item.preserveWhenMissing);
   }
 
   await writeExtraPathManifest(plan, plan.extraConfigs);
   await writeExtraPathManifest(plan, plan.extraSecrets);
+  await cleanupUnreferencedChunkStores(plan.repoRoot);
+}
+
+async function copyChunkableItemToRepo(
+  item: SyncItem,
+  repoRoot: string,
+  options: ChunkOptions = {}
+): Promise<void> {
+  if (!(await pathExists(item.localPath))) {
+    if (!item.preserveWhenMissing) await removePath(item.repoPath);
+    return;
+  }
+
+  if (item.type === 'file') {
+    await copyChunkableDbBundleToRepo(item.localPath, item.repoPath, repoRoot, options);
+    return;
+  }
+
+  const tempPath = `${item.repoPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    await copyChunkableDirectoryToRepo(item.localPath, tempPath, item.repoPath, repoRoot, options);
+    await replaceDirectory(tempPath, item.repoPath);
+  } catch (error) {
+    await removePath(tempPath);
+    throw error;
+  }
+}
+
+async function copyChunkableItemFromRepo(
+  item: SyncItem,
+  repoRoot: string,
+  options: ChunkOptions = {}
+): Promise<void> {
+  if (!(await pathExists(item.repoPath))) return;
+
+  if (item.type === 'file') {
+    await copyChunkableDbBundleFromRepo(item.repoPath, item.localPath, repoRoot, options);
+    return;
+  }
+
+  const tempPath = `${item.localPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    await copyChunkableDirectoryFromRepo(item.repoPath, tempPath, repoRoot, options);
+    await replaceDirectory(tempPath, item.localPath);
+  } catch (error) {
+    await removePath(tempPath);
+    throw error;
+  }
+}
+
+async function copyChunkableDbBundleToRepo(
+  sourceDbPath: string,
+  repoDbPath: string,
+  repoRoot: string,
+  options: ChunkOptions
+): Promise<void> {
+  const stageDir = path.join(
+    path.dirname(repoDbPath),
+    `.db-bundle-${process.pid}-${crypto.randomUUID()}`
+  );
+  const destinations = [
+    repoDbPath,
+    ...SESSION_DB_SIDECAR_SUFFIXES.map((suffix) => `${repoDbPath}${suffix}`),
+  ];
+  try {
+    await fs.mkdir(stageDir, { recursive: true, mode: 0o700 });
+    await copySessionFileToRepo(
+      sourceDbPath,
+      path.join(stageDir, path.basename(repoDbPath)),
+      repoRoot,
+      options,
+      repoDbPath
+    );
+    for (const suffix of SESSION_DB_SIDECAR_SUFFIXES) {
+      const sourcePath = `${sourceDbPath}${suffix}`;
+      if (!(await pathExists(sourcePath))) continue;
+      await copySessionFileToRepo(
+        sourcePath,
+        path.join(stageDir, `${path.basename(repoDbPath)}${suffix}`),
+        repoRoot,
+        options,
+        `${repoDbPath}${suffix}`
+      );
+    }
+    await replaceFileBundle(stageDir, destinations);
+  } catch (error) {
+    await removePath(stageDir);
+    throw error;
+  }
+}
+
+async function copyChunkableDbBundleFromRepo(
+  repoDbPath: string,
+  destinationDbPath: string,
+  repoRoot: string,
+  options: ChunkOptions
+): Promise<void> {
+  const stageDir = path.join(
+    path.dirname(destinationDbPath),
+    `.db-bundle-${process.pid}-${crypto.randomUUID()}`
+  );
+  const destinations = [
+    destinationDbPath,
+    ...SESSION_DB_SIDECAR_SUFFIXES.map((suffix) => `${destinationDbPath}${suffix}`),
+  ];
+  try {
+    await fs.mkdir(stageDir, { recursive: true, mode: 0o700 });
+    await copySessionFileFromRepo(
+      repoDbPath,
+      path.join(stageDir, path.basename(destinationDbPath)),
+      repoRoot,
+      options
+    );
+    for (const suffix of SESSION_DB_SIDECAR_SUFFIXES) {
+      const sourcePath = `${repoDbPath}${suffix}`;
+      if (!(await pathExists(sourcePath))) continue;
+      await copySessionFileFromRepo(
+        sourcePath,
+        path.join(stageDir, `${path.basename(destinationDbPath)}${suffix}`),
+        repoRoot,
+        options
+      );
+    }
+    await replaceFileBundle(stageDir, destinations);
+  } catch (error) {
+    await removePath(stageDir);
+    throw error;
+  }
+}
+
+async function replaceFileBundle(stageDir: string, destinations: string[]): Promise<void> {
+  const backupDir = `${stageDir}.backup`;
+  await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+  const movedDestinations: string[] = [];
+  try {
+    for (const destination of destinations) {
+      if (!(await pathExists(destination))) continue;
+      await fs.rename(destination, path.join(backupDir, path.basename(destination)));
+    }
+
+    const stagedEntries = await fs.readdir(stageDir, { withFileTypes: true });
+    for (const entry of stagedEntries) {
+      if (!entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error(`Invalid staged database bundle entry: ${entry.name}`);
+      }
+      const destination = destinations.find((candidate) => path.basename(candidate) === entry.name);
+      if (!destination) throw new Error(`Unexpected staged database bundle entry: ${entry.name}`);
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.rename(path.join(stageDir, entry.name), destination);
+      movedDestinations.push(destination);
+    }
+  } catch (error) {
+    for (const destination of movedDestinations) await removePath(destination);
+    const backups = await fs.readdir(backupDir).catch(() => []);
+    for (const name of backups) {
+      const destination = destinations.find((candidate) => path.basename(candidate) === name);
+      if (destination) await fs.rename(path.join(backupDir, name), destination);
+    }
+    await removePath(backupDir);
+    throw error;
+  }
+  await removePath(stageDir).catch(() => undefined);
+  await removePath(backupDir).catch(() => undefined);
+}
+
+async function copyChunkableDirectoryToRepo(
+  sourcePath: string,
+  destinationPath: string,
+  logicalRepoPath: string,
+  repoRoot: string,
+  options: ChunkOptions
+): Promise<void> {
+  const stat = await assertDirectory(sourcePath, 'session source directory');
+  await fs.mkdir(destinationPath, { recursive: true, mode: stat.mode & 0o777 });
+  const entries = await fs.readdir(sourcePath, { withFileTypes: true });
+  const entryNames = entries.map((entry) => entry.name).sort();
+
+  for (const entry of entries) {
+    const entrySource = path.join(sourcePath, entry.name);
+    const entryDestination = path.join(destinationPath, entry.name);
+    const entryLogicalPath = path.join(logicalRepoPath, entry.name);
+    if (entry.isSymbolicLink())
+      throw new Error(`Session source contains a symlink: ${entrySource}`);
+    if (entry.isDirectory()) {
+      await copyChunkableDirectoryToRepo(
+        entrySource,
+        entryDestination,
+        entryLogicalPath,
+        repoRoot,
+        options
+      );
+      continue;
+    }
+    if (!entry.isFile())
+      throw new Error(`Session source contains an unsupported entry: ${entrySource}`);
+    await copySessionFileToRepo(entrySource, entryDestination, repoRoot, options, entryLogicalPath);
+  }
+  await assertDirectoryUnchanged(sourcePath, stat, entryNames);
+  await chmodIfExists(destinationPath, stat.mode & 0o777);
+}
+
+async function copyChunkableDirectoryFromRepo(
+  sourcePath: string,
+  destinationPath: string,
+  repoRoot: string,
+  options: ChunkOptions
+): Promise<void> {
+  const stat = await assertDirectory(sourcePath, 'repository session directory');
+  await fs.mkdir(destinationPath, { recursive: true, mode: stat.mode & 0o777 });
+  const entries = await fs.readdir(sourcePath, { withFileTypes: true });
+  const entryNames = entries.map((entry) => entry.name).sort();
+
+  for (const entry of entries) {
+    const entrySource = path.join(sourcePath, entry.name);
+    const entryDestination = path.join(destinationPath, entry.name);
+    if (entry.isSymbolicLink())
+      throw new Error(`Repository session contains a symlink: ${entrySource}`);
+    if (entry.isDirectory()) {
+      await copyChunkableDirectoryFromRepo(entrySource, entryDestination, repoRoot, options);
+      continue;
+    }
+    if (!entry.isFile())
+      throw new Error(`Repository session has an unsupported entry: ${entrySource}`);
+    await copySessionFileFromRepo(entrySource, entryDestination, repoRoot, options);
+  }
+  await assertDirectoryUnchanged(sourcePath, stat, entryNames);
+  await chmodIfExists(destinationPath, stat.mode & 0o777);
+}
+
+async function replaceDirectory(sourcePath: string, destinationPath: string): Promise<void> {
+  const backupPath = `${destinationPath}.backup-${process.pid}-${crypto.randomUUID()}`;
+  const hadDestination = await pathExists(destinationPath);
+  if (hadDestination) await fs.rename(destinationPath, backupPath);
+  try {
+    await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+    await fs.rename(sourcePath, destinationPath);
+    if (hadDestination) await removePath(backupPath);
+  } catch (error) {
+    if (hadDestination && !(await pathExists(destinationPath))) {
+      await fs.rename(backupPath, destinationPath);
+    }
+    throw error;
+  }
+}
+
+async function assertDirectory(directoryPath: string, label: string): Promise<Stats> {
+  const stat = await fs.lstat(directoryPath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular directory: ${directoryPath}`);
+  }
+  return stat;
+}
+
+async function assertDirectoryUnchanged(
+  directoryPath: string,
+  initialStat: Stats,
+  initialNames: string[]
+): Promise<void> {
+  const finalStat = await assertDirectory(directoryPath, 'session directory');
+  const finalNames = (await fs.readdir(directoryPath)).sort();
+  if (
+    finalStat.mtimeMs !== initialStat.mtimeMs ||
+    finalStat.ctimeMs !== initialStat.ctimeMs ||
+    finalStat.dev !== initialStat.dev ||
+    finalStat.ino !== initialStat.ino ||
+    finalNames.length !== initialNames.length ||
+    finalNames.some((name, index) => name !== initialNames[index])
+  ) {
+    throw new Error(`Session directory changed while it was being copied: ${directoryPath}`);
+  }
 }
 
 async function copyItem(
@@ -284,14 +577,14 @@ async function applyExtraPaths(plan: SyncPlan, extra: ExtraPathPlan): Promise<vo
   const manifest = parseJsonc<ExtraPathManifest>(manifestContent);
 
   for (const entry of manifest.entries) {
-    const normalized = normalizePath(entry.sourcePath, plan.homeDir, plan.platform);
+    const pathApi = plan.platform === 'win32' ? path.win32 : path.posix;
+    const localPath = fromPortablePath(entry.sourcePath, plan.configRoot, plan.homeDir, pathApi);
+    const normalized = normalizePath(localPath, plan.homeDir, plan.platform);
     const isAllowed = allowlist.includes(normalized);
     if (!isAllowed) continue;
 
-    const repoPath = path.isAbsolute(entry.repoPath)
-      ? entry.repoPath
-      : path.join(plan.repoRoot, entry.repoPath);
-    const localPath = entry.sourcePath;
+    const repoPath = resolveManifestRepoPath(plan.repoRoot, entry.repoPath);
+    if (!repoPath) continue;
     const entryType: ExtraPathType = entry.type ?? 'file';
 
     if (!(await pathExists(repoPath))) continue;
@@ -320,12 +613,15 @@ async function writeExtraPathManifest(plan: SyncPlan, extra: ExtraPathPlan): Pro
       continue;
     }
     const stat = await fs.stat(sourcePath);
+    const pathApi = plan.platform === 'win32' ? path.win32 : path.posix;
+    const portableSourcePath = toPortablePath(sourcePath, plan.configRoot, plan.homeDir, pathApi);
+    const manifestRepoPath = toManifestRepoPath(plan.repoRoot, entry.repoPath);
     if (stat.isDirectory()) {
       await copyDirRecursive(sourcePath, entry.repoPath);
       const items = await collectExtraPathItems(sourcePath, sourcePath);
       entries.push({
-        sourcePath,
-        repoPath: path.relative(plan.repoRoot, entry.repoPath),
+        sourcePath: portableSourcePath,
+        repoPath: manifestRepoPath,
         type: 'dir',
         mode: stat.mode & 0o777,
         items,
@@ -335,8 +631,8 @@ async function writeExtraPathManifest(plan: SyncPlan, extra: ExtraPathPlan): Pro
     if (stat.isFile()) {
       await copyFileWithMode(sourcePath, entry.repoPath);
       entries.push({
-        sourcePath,
-        repoPath: path.relative(plan.repoRoot, entry.repoPath),
+        sourcePath: portableSourcePath,
+        repoPath: manifestRepoPath,
         type: 'file',
         mode: stat.mode & 0o777,
       });
@@ -356,7 +652,7 @@ async function collectExtraPathItems(
 
   for (const entry of entries) {
     const entrySource = path.join(sourcePath, entry.name);
-    const relativePath = path.relative(basePath, entrySource);
+    const relativePath = toPortableSeparators(path.relative(basePath, entrySource));
 
     if (entry.isDirectory()) {
       const stat = await fs.stat(entrySource);
@@ -409,10 +705,11 @@ async function applyExtraPathModes(
 
 function resolveExtraPathItem(basePath: string, relativePath: string): string | null {
   if (!relativePath) return null;
-  if (path.isAbsolute(relativePath)) return null;
+  const normalizedRelativePath = toPortableSeparators(relativePath);
+  if (path.posix.isAbsolute(normalizedRelativePath)) return null;
 
   const resolvedBase = path.resolve(basePath);
-  const resolvedPath = path.resolve(basePath, relativePath);
+  const resolvedPath = path.resolve(basePath, normalizedRelativePath);
   const relative = path.relative(resolvedBase, resolvedPath);
   if (relative === '..' || relative.startsWith(`..${path.sep}`)) {
     return null;
@@ -422,6 +719,33 @@ function resolveExtraPathItem(basePath: string, relativePath: string): string | 
   }
 
   return resolvedPath;
+}
+
+function resolveManifestRepoPath(repoRoot: string, manifestRepoPath: string): string | null {
+  if (!manifestRepoPath) return null;
+
+  const resolvedRoot = path.resolve(repoRoot);
+  const portableRepoPath = toPortableSeparators(manifestRepoPath);
+  const resolvedPath = path.isAbsolute(manifestRepoPath)
+    ? path.resolve(manifestRepoPath)
+    : path.resolve(resolvedRoot, portableRepoPath);
+  const relative = path.relative(resolvedRoot, resolvedPath);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`)) return null;
+  if (path.isAbsolute(relative)) return null;
+
+  return resolvedPath;
+}
+
+function toManifestRepoPath(repoRoot: string, repoPath: string): string {
+  const containedPath = resolveManifestRepoPath(repoRoot, repoPath);
+  if (!containedPath) {
+    throw new Error(`Extra path repository target is outside the sync repo: ${repoPath}`);
+  }
+  return toPortableSeparators(path.relative(path.resolve(repoRoot), containedPath));
+}
+
+function toPortableSeparators(inputPath: string): string {
+  return inputPath.replace(/\\/g, '/');
 }
 
 function isDeepEqual(left: unknown, right: unknown): boolean {

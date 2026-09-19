@@ -4,7 +4,13 @@ import { fileURLToPath } from 'node:url';
 import type { Plugin } from '@opencode-ai/plugin';
 import { tool } from '@opencode-ai/plugin';
 
-import { applyOverridesToRuntimeConfig, loadOverrides } from './sync/config.js';
+import {
+  applyOverridesToRuntimeConfig,
+  EnvPlaceholderResolutionError,
+  hasOwn,
+  isPlainObject,
+  loadOverrides,
+} from './sync/config.js';
 import { SyncCommandError, SyncConfigMissingError } from './sync/errors.js';
 import { resolveSyncLocations } from './sync/paths.js';
 import { createSyncService } from './sync/service.js';
@@ -170,6 +176,12 @@ export const opencodeConfigSync: Plugin = async (ctx) => {
       extraSecretPaths: tool.schema.array(tool.schema.string()).optional(),
       extraConfigPaths: tool.schema.array(tool.schema.string()).optional(),
       localRepoPath: tool.schema.string().optional().describe('Override local repo path'),
+      acknowledgePrivateRemote: tool.schema
+        .boolean()
+        .optional()
+        .describe(
+          'Acknowledge that an explicit non-GitHub remote is private (only after user confirmation)'
+        ),
       setupTurso: tool.schema
         .boolean()
         .optional()
@@ -206,11 +218,14 @@ export const opencodeConfigSync: Plugin = async (ctx) => {
             extraSecretPaths: args.extraSecretPaths,
             extraConfigPaths: args.extraConfigPaths,
             localRepoPath: args.localRepoPath,
+            acknowledgePrivateRemote: args.acknowledgePrivateRemote,
           });
         }
         if (args.command === 'link') {
           return await service.link({
             repo: args.repo ?? args.name,
+            branch: args.branch,
+            acknowledgePrivateRemote: args.acknowledgePrivateRemote,
           });
         }
         if (args.command === 'pull') {
@@ -232,6 +247,7 @@ export const opencodeConfigSync: Plugin = async (ctx) => {
           return await service.enableSecrets({
             extraSecretPaths: args.extraSecretPaths,
             includeMcpSecrets: args.includeMcpSecrets,
+            acknowledgePrivateRemote: args.acknowledgePrivateRemote,
           });
         }
         if (args.command === 'sessions-backend') {
@@ -293,13 +309,26 @@ export const opencodeConfigSync: Plugin = async (ctx) => {
         };
       }
 
-      try {
-        const overrides = await loadOverrides(resolveSyncLocations());
-        if (overrides) {
+      const overrides = await loadOverrides(resolveSyncLocations());
+      if (overrides) {
+        try {
           applyOverridesToRuntimeConfig(config as Record<string, unknown>, overrides);
+        } catch (error) {
+          if (error instanceof EnvPlaceholderResolutionError) {
+            disableMcpServerForResolutionFailure(
+              config as Record<string, unknown>,
+              error.fieldPath
+            );
+            await ctx.client.app.log({
+              body: {
+                service: 'opencode-synced',
+                level: 'error',
+                message: error.message,
+              },
+            });
+          }
+          throw error;
         }
-      } catch {
-        return;
       }
     },
   };
@@ -307,6 +336,25 @@ export const opencodeConfigSync: Plugin = async (ctx) => {
 
 export const opencodeSynced = opencodeConfigSync;
 export default opencodeConfigSync;
+
+function disableMcpServerForResolutionFailure(
+  config: Record<string, unknown>,
+  fieldPath: readonly string[]
+): void {
+  if (fieldPath[0] !== 'overrides' || fieldPath[1] !== 'mcp') return;
+  const serverName = fieldPath[2];
+  if (!serverName) return;
+
+  const mcp = isPlainObject(config.mcp) ? config.mcp : null;
+  if (!mcp || !hasOwn(mcp, serverName) || !isPlainObject(mcp[serverName])) return;
+
+  Object.defineProperty(mcp[serverName], 'enabled', {
+    value: false,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
 
 function formatError(error: unknown): string {
   if (error instanceof Error) return error.message;
