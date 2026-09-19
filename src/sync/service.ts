@@ -21,6 +21,7 @@ import { SyncCommandError, SyncConfigMissingError } from './errors.js';
 import type { SyncLockInfo } from './lock.js';
 import { withSyncLock } from './lock.js';
 import { buildSyncPlan, resolveRepoRoot, resolveSyncLocations } from './paths.js';
+import { ensureShell } from './shell.js';
 import {
   commitAll,
   ensureRepoCloned,
@@ -125,9 +126,20 @@ export interface SyncService {
   resolve: () => Promise<string>;
 }
 
-export function createSyncService(ctx: SyncServiceContext): SyncService {
+export function createSyncService(hostCtx: SyncServiceContext): SyncService {
+  // Some hosts (notably non-Bun runtimes) do not supply a callable `$` in the plugin
+  // context. Substitute a Node-backed shell so sync operations keep working instead of
+  // failing with "$ is not a function".
+  const { shell: resolvedShell, fallback: usingFallbackShell } = ensureShell(hostCtx.$);
+  const ctx: SyncServiceContext = usingFallbackShell
+    ? { ...hostCtx, $: resolvedShell }
+    : hostCtx;
+
   const locations = resolveSyncLocations();
   const log = createLogger(ctx.client);
+  if (usingFallbackShell) {
+    log.debug('Host did not provide a callable shell; using the Node-backed fallback.');
+  }
   const lockPath = path.join(path.dirname(locations.statePath), 'sync.lock');
   const strictLinkRepo = resolveStrictLinkRepo(process.env.OPENCODE_SYNC_E2E_STRICT_LINK_REPO);
   const disableAutoRepoDiscovery =
